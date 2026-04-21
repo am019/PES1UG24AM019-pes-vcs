@@ -22,6 +22,20 @@
 #define MODE_EXEC      0100755
 #define MODE_DIR       0040000
 
+// Forward declaration from object.c
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+
+typedef struct {
+    uint32_t mode;
+    ObjectID hash;
+    char path[512];
+} TreeIndexEntry;
+
+typedef struct {
+    TreeIndexEntry entries[MAX_TREE_ENTRIES];
+    int count;
+} TreeIndex;
+
 // ─── PROVIDED ───────────────────────────────────────────────────────────────
 
 // Determine the object mode for a filesystem path.
@@ -129,9 +143,107 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+static int tree_contains_entry(const Tree *tree, const char *name) {
+    for (int i = 0; i < tree->count; i++) {
+        if (strcmp(tree->entries[i].name, name) == 0) return 1;
+    }
+    return 0;
+}
+
+static int load_tree_index(TreeIndex *index) {
+    index->count = 0;
+
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) return 0;
+
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        if (index->count >= MAX_TREE_ENTRIES) {
+            fclose(f);
+            return -1;
+        }
+
+        TreeIndexEntry *entry = &index->entries[index->count];
+        char hex[HASH_HEX_SIZE + 1];
+        unsigned int mode;
+        unsigned long long mtime_ignored;
+        unsigned int size_ignored;
+        char path[512];
+
+        if (sscanf(line, "%o %64s %llu %u %511[^\n]",
+                   &mode, hex, &mtime_ignored, &size_ignored, path) != 5) {
+            fclose(f);
+            return -1;
+        }
+
+        entry->mode = mode;
+        snprintf(entry->path, sizeof(entry->path), "%s", path);
+        if (hex_to_hash(hex, &entry->hash) != 0) {
+            fclose(f);
+            return -1;
+        }
+
+        index->count++;
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static int write_tree_level(const TreeIndex *index, const char *prefix, ObjectID *id_out) {
+    Tree tree = {0};
+    size_t prefix_len = strlen(prefix);
+
+    for (int i = 0; i < index->count; i++) {
+        const char *path = index->entries[i].path;
+        if (strncmp(path, prefix, prefix_len) != 0) continue;
+
+        const char *remainder = path + prefix_len;
+        if (*remainder == '\0') continue;
+
+        const char *slash = strchr(remainder, '/');
+        if (!slash) {
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+            TreeEntry *entry = &tree.entries[tree.count++];
+            entry->mode = index->entries[i].mode;
+            entry->hash = index->entries[i].hash;
+            snprintf(entry->name, sizeof(entry->name), "%s", remainder);
+            continue;
+        }
+
+        size_t dir_len = (size_t)(slash - remainder);
+        if (dir_len == 0 || dir_len >= sizeof(tree.entries[0].name)) return -1;
+
+        char dir_name[256];
+        memcpy(dir_name, remainder, dir_len);
+        dir_name[dir_len] = '\0';
+
+        if (tree_contains_entry(&tree, dir_name)) continue;
+        if (tree.count >= MAX_TREE_ENTRIES) return -1;
+
+        char child_prefix[512];
+        snprintf(child_prefix, sizeof(child_prefix), "%s%s/", prefix, dir_name);
+
+        ObjectID child_id;
+        if (write_tree_level(index, child_prefix, &child_id) != 0) return -1;
+
+        TreeEntry *entry = &tree.entries[tree.count++];
+        entry->mode = MODE_DIR;
+        entry->hash = child_id;
+        snprintf(entry->name, sizeof(entry->name), "%s", dir_name);
+    }
+
+    void *raw = NULL;
+    size_t raw_len = 0;
+    if (tree_serialize(&tree, &raw, &raw_len) != 0) return -1;
+
+    int rc = object_write(OBJ_TREE, raw, raw_len, id_out);
+    free(raw);
+    return rc;
+}
+
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    TreeIndex index;
+    if (load_tree_index(&index) != 0) return -1;
+    return write_tree_level(&index, "", id_out);
 }
